@@ -27,9 +27,9 @@ struct SettingsView: View {
             }
 
             VStack(alignment: .leading, spacing: 6) {
-                Text("Anthropic API key").font(.subheadline.weight(.medium))
+                Text("DeepSeek API key").font(.subheadline.weight(.medium))
                 HStack {
-                    SecureField("sk-ant-...", text: $apiKeyDraft)
+                    SecureField("sk-...", text: $apiKeyDraft)
                         .textFieldStyle(.roundedBorder)
                         .onSubmit(saveKey)
                     Button("Save", action: saveKey)
@@ -39,7 +39,7 @@ struct SettingsView: View {
                     Text(settings.apiKey.isEmpty ? "No key saved" : "Key saved in Keychain")
                         .foregroundStyle(.secondary)
                     Spacer()
-                    Link("Get a key", destination: URL(string: "https://console.anthropic.com/settings/keys")!)
+                    Link("Get a key", destination: URL(string: "https://platform.deepseek.com/api_keys")!)
                 }
                 .font(.caption)
             }

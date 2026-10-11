@@ -2,7 +2,7 @@
 
 Companion lyrics translator for Apple Music on the Mac, and a [Cider](https://cider.sh/) plugin for Windows and Linux.
 
-Music.app has no plugin API, so the Mac app is a menu-bar companion. It reads the current track from Music, fetches time-synced lyrics from [LRCLIB](https://lrclib.net), translates them with [Claude Haiku](https://docs.anthropic.com/en/docs/about-claude/models/overview), and shows each translation under the original line in a floating panel attached to the Music window.
+Music.app has no plugin API, so the Mac app is a menu-bar companion. It reads the current track from Music, fetches time-synced lyrics from [LRCLIB](https://lrclib.net), translates them with [DeepSeek V4.1 Flash](https://api-docs.deepseek.com/news/news260910), and shows each translation under the original line in a floating panel attached to the Music window.
 
 On Windows and Linux the same pipeline runs inside Cider as a plugin and writes translations under Cider's own lyric lines. Docker is not part of this project: a container cannot sit on Cider's lyrics view.
 
@@ -10,7 +10,7 @@ On Windows and Linux the same pipeline runs inside Cider as a plugin and writes 
 
 - macOS 14 or later for the Music.app companion
 - [Cider](https://cider.sh/) 2 or later for the Windows/Linux plugin
-- An [Anthropic API key](https://console.anthropic.com/settings/keys)
+- A [DeepSeek API key](https://platform.deepseek.com/api_keys)
 - Swift 5.10+ to build the Mac app, or Node 22+ to test/bundle the Cider plugin
 
 Xcode is optional. Command Line Tools are enough to run `scripts/build-app.sh`.
@@ -56,9 +56,9 @@ Music.app or Cider
    LyricsCore / cider-plugin/lib
         │
         ├─ LRCLIB synced lyrics
-        ├─ Claude translation (cached)
+        ├─ DeepSeek translation (cached)
         ▼
    Overlay panel  or  Cider lyric lines
 ```
 
-Repeat plays of the same song and language are served from cache and do not call Anthropic again.
+Repeat plays of the same song and language are served from cache and do not call DeepSeek again.

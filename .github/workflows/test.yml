@@ -1,4 +1,4 @@
-name: Test
+name: Test and release
 
 on:
   push:
@@ -6,7 +6,21 @@ on:
       - "**"
   pull_request:
 
+# Jobs only read the repository unless they ask for more below.
+permissions:
+  contents: read
+
 jobs:
+  secrets:
+    name: Secret scan
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Check tracked files for keys and tokens
+        run: ./scripts/check-secrets.sh
+
   lyrics-core:
     name: LyricsCore (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
@@ -16,12 +30,24 @@ jobs:
         os: [macos-latest, ubuntu-latest]
     steps:
       - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
       - uses: swift-actions/setup-swift@v2
         if: runner.os == 'Linux'
         with:
           swift-version: "6.0"
       - name: Run Swift tests
         run: swift run LyricsCoreTestRunner
+
+  mac-app:
+    name: Mac app build
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Build the app bundle
+        run: ./scripts/build-app.sh
 
   cider-plugin:
     name: Cider plugin (${{ matrix.os }})
@@ -30,12 +56,76 @@ jobs:
       fail-fast: false
       matrix:
         os: [macos-latest, ubuntu-latest, windows-latest]
+    defaults:
+      run:
+        shell: bash
     steps:
       - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
       - uses: actions/setup-node@v4
         with:
           node-version: "22"
-      - name: Run plugin tests
-        run: npm test --prefix cider-plugin
       - name: Bundle plugin
         run: npm run bundle --prefix cider-plugin
+      - name: Check the committed bundle matches the source
+        run: git diff --exit-code --ignore-cr-at-eol -- cider-plugin/dist
+      - name: Run plugin tests
+        run: npm test --prefix cider-plugin
+
+  release:
+    name: Release
+    needs: [secrets, lyrics-core, mac-app, cider-plugin]
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: macos-latest
+    permissions:
+      contents: write
+    concurrency:
+      group: release
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Pick the version
+        id: version
+        run: |
+          base=$(node -p "require('./cider-plugin/package.json').version.split('.').slice(0, 2).join('.')")
+          echo "value=$base.$GITHUB_RUN_NUMBER" >> "$GITHUB_OUTPUT"
+
+      - name: Build the Cider plugin
+        env:
+          PLUGIN_VERSION: ${{ steps.version.outputs.value }}
+        run: |
+          npm run bundle --prefix cider-plugin
+          mkdir -p release
+          # Cider installs a zip with plugin.yml at its root.
+          (cd cider-plugin/dist && zip -X -q "../../release/lyrics-translator-cider-plugin-$PLUGIN_VERSION.zip" plugin.js plugin.yml plugin.json)
+
+      - name: Build the Mac app
+        env:
+          VERSION: ${{ steps.version.outputs.value }}
+        run: |
+          /usr/libexec/PlistBuddy -c "Set :CFBundleShortVersionString $VERSION" Resources/Info.plist
+          /usr/libexec/PlistBuddy -c "Set :CFBundleVersion $GITHUB_RUN_NUMBER" Resources/Info.plist
+          ./scripts/build-app.sh
+          ditto -c -k --keepParent "build/Lyrics Translator.app" "release/Lyrics-Translator-macOS-$VERSION.zip"
+
+      - name: Check release files for keys and tokens
+        run: ./scripts/check-secrets.sh release cider-plugin/dist "build/Lyrics Translator.app"
+
+      - name: Publish the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ steps.version.outputs.value }}
+        run: |
+          (cd release && shasum -a 256 * > SHA256SUMS.txt)
+          gh release create "v$VERSION" release/* \
+            --repo "$GITHUB_REPOSITORY" \
+            --target "$GITHUB_SHA" \
+            --title "v$VERSION" \
+            --generate-notes

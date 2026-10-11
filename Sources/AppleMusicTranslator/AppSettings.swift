@@ -1,4 +1,5 @@
 import Foundation
+import LyricsCore
 import ServiceManagement
 
 enum DockMode: String, CaseIterable, Identifiable {
@@ -24,7 +25,7 @@ final class AppSettings: ObservableObject {
         "Chinese (Simplified)", "Chinese (Traditional)", "Tagalog",
     ]
 
-    static let defaultModel = "claude-haiku-5-5"
+    static let defaultModel = TranslationService.defaultModel
 
     private let defaults = UserDefaults.standard
 
@@ -47,18 +48,19 @@ final class AppSettings: ObservableObject {
         didSet { defaults.set(prefetchNext, forKey: "prefetchNext") }
     }
     @Published var apiKey: String {
-        didSet { Keychain.write(apiKey, for: "anthropic-api-key") }
+        didSet { Keychain.write(apiKey, for: "deepseek-api-key") }
     }
     @Published private(set) var launchAtLogin: Bool
 
     init() {
         targetLanguage = defaults.string(forKey: "targetLanguage") ?? Self.systemLanguage()
-        model = defaults.string(forKey: "model") ?? Self.defaultModel
+        let storedModel = defaults.string(forKey: "model") ?? Self.defaultModel
+        model = storedModel.contains("claude") || storedModel.contains("haiku") ? Self.defaultModel : storedModel
         overlayEnabled = defaults.object(forKey: "overlayEnabled") as? Bool ?? true
         fontSize = defaults.object(forKey: "fontSize") as? Double ?? 22
         dockMode = DockMode(rawValue: defaults.string(forKey: "dockMode") ?? "") ?? .beside
         prefetchNext = defaults.object(forKey: "prefetchNext") as? Bool ?? true
-        apiKey = Keychain.read("anthropic-api-key") ?? ""
+        apiKey = Keychain.read("deepseek-api-key") ?? ""
         launchAtLogin = SMAppService.mainApp.status == .enabled
     }
 

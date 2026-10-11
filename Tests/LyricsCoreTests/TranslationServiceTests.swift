@@ -4,14 +4,13 @@ import LyricsCore
 func registerTranslationServiceTests() {
     let track = Track(name: "Song", artist: "Artist", album: "Album", duration: 180)
 
-    @Sendable func reply(_ translations: [String], extraBlocks: [[String: Any]] = []) -> String {
-        let text = json(["translations": translations])
-        return json(["content": extraBlocks + [["type": "text", "text": text]]])
+    @Sendable func reply(_ translations: [String]) -> String {
+        json(["choices": [["message": ["content": json(["translations": translations])]]]])
     }
 
     @Sendable func translate(_ lines: [String], http: FakeHTTP, apiKey: String = "test-key") async throws -> [String: String] {
         try await TranslationService(http: http.client)
-            .translate(lines: lines, track: track, to: "English", model: "claude-haiku-5-5", apiKey: apiKey)
+            .translate(lines: lines, track: track, to: "English", model: "deepseek-flash", apiKey: apiKey)
     }
 
     TestRuntime.add("throws without API key") {
@@ -29,15 +28,15 @@ func registerTranslationServiceTests() {
         try expectEqual(result, ["안녕": "Hello", "잘가": "Goodbye"])
 
         let body = await http.jsonBody(at: 0)
-        try expect(body["model"] as? String == "claude-haiku-5-5")
-        let messages = body["messages"] as? [[String: Any]]
-        let content = messages?.first?["content"] as? String ?? ""
-        try expect(content.contains(#"["안녕","잘가"]"#))
-        try expect((body["system"] as? String)?.contains("exactly 2 strings") == true)
+        try expect(body["model"] as? String == "deepseek-flash")
+        try expect((body["thinking"] as? [String: String])?["type"] == "disabled")
+        let messages = body["messages"] as? [[String: Any]] ?? []
+        try expect(messages.first?["role"] as? String == "system")
+        try expect((messages.first?["content"] as? String)?.contains("exactly 2 strings") == true)
+        try expect((messages.last?["content"] as? String)?.contains(#"["안녕","잘가"]"#) == true)
 
         let request = await http.requests[0]
-        try expectEqual(request.value(forHTTPHeaderField: "x-api-key"), "test-key")
-        try expectEqual(request.value(forHTTPHeaderField: "anthropic-version"), "2023-06-01")
+        try expectEqual(request.value(forHTTPHeaderField: "Authorization"), "Bearer test-key")
         try expectEqual(request.httpMethod, "POST")
     }
 
@@ -48,9 +47,8 @@ func registerTranslationServiceTests() {
         try expect(await http.requests.isEmpty)
     }
 
-    TestRuntime.add("ignores thinking blocks") {
-        let thinking: [String: Any] = ["type": "thinking", "thinking": "{\"translations\": [\"wrong\"]}"]
-        let http = FakeHTTP([(200, reply(["Hello"], extraBlocks: [thinking]))])
+    TestRuntime.add("reads the assistant message content") {
+        let http = FakeHTTP([(200, reply(["Hello"]))])
         let result = try await translate(["안녕"], http: http)
         try expectEqual(result, ["안녕": "Hello"])
     }
@@ -63,7 +61,7 @@ func registerTranslationServiceTests() {
     }
 
     TestRuntime.add("gives up after two malformed responses") {
-        let http = FakeHTTP([(200, reply(["x"])), (200, json(["content": []]))])
+        let http = FakeHTTP([(200, reply(["x"])), (200, json(["choices": [["message": ["content": ""]]]]))])
         try await expectThrows(TranslationError.malformedResponse) {
             _ = try await translate(["a", "b"], http: http)
         }

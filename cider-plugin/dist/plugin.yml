@@ -1,6 +1,6 @@
 name: Lyrics Translator
 identifier: com.jpark9013.apple-music-translator
-description: Translate lyrics with Claude and show them under each line in Cider.
+description: Translate lyrics with DeepSeek and show them under each line in Cider.
 author: jpark9013
 version: 0.1.0
 entry: plugin.js

@@ -11,7 +11,7 @@ public enum TranslationError: LocalizedError, Equatable {
     public var errorDescription: String? {
         switch self {
         case .missingAPIKey:
-            "Add your Anthropic API key in the menu bar settings to see translations."
+            "Add your DeepSeek API key in the menu bar settings to see translations."
         case let .api(status, message):
             "Translation failed (\(status)): \(message)"
         case .malformedResponse:
@@ -28,9 +28,10 @@ public enum TranslationError: LocalizedError, Equatable {
     }
 }
 
-/// Translates song lyrics with Claude through the Anthropic Messages API.
+/// Translates song lyrics with DeepSeek V4.1 Flash through the Chat Completions API.
 public struct TranslationService: Sendable {
-    public static let defaultEndpoint = URL(string: "https://api.anthropic.com/v1/messages")!
+    public static let defaultEndpoint = URL(string: "https://api.deepseek.com/chat/completions")!
+    public static let defaultModel = "deepseek-flash"
 
     private let endpoint: URL
     private let http: HTTPClient
@@ -93,8 +94,13 @@ public struct TranslationService: Sendable {
         let body: [String: Any] = [
             "model": model,
             "max_tokens": 8192,
-            "system": systemPrompt(language: language, count: lines.count),
-            "messages": [["role": "user", "content": user]],
+            "response_format": ["type": "json_object"],
+            // Reasoning made up ~85-90% of output tokens with no gain for this task.
+            "thinking": ["type": "disabled"],
+            "messages": [
+                ["role": "system", "content": systemPrompt(language: language, count: lines.count)],
+                ["role": "user", "content": user],
+            ],
         ]
         return try JSONSerialization.data(withJSONObject: body)
     }
@@ -102,8 +108,7 @@ public struct TranslationService: Sendable {
     private func send(_ lines: [String], track: Track, language: String, model: String, apiKey: String) async throws -> [String] {
         var request = URLRequest(url: endpoint)
         request.httpMethod = "POST"
-        request.setValue(apiKey, forHTTPHeaderField: "x-api-key")
-        request.setValue("2023-06-01", forHTTPHeaderField: "anthropic-version")
+        request.setValue("Bearer \(apiKey)", forHTTPHeaderField: "Authorization")
         request.setValue("application/json", forHTTPHeaderField: "content-type")
         request.httpBody = try Self.requestBody(lines: lines, track: track, language: language, model: model)
 
@@ -116,16 +121,17 @@ public struct TranslationService: Sendable {
             throw TranslationError.api(status: status, message: message)
         }
 
-        // Only "text" blocks carry the answer; thinking blocks are skipped.
-        let text = (json?["content"] as? [[String: Any]] ?? [])
-            .filter { $0["type"] as? String == "text" }
-            .compactMap { $0["text"] as? String }
-            .joined()
-
+        let text = Self.assistantText(json)
         guard let translations = Self.parseTranslations(text), translations.count == lines.count else {
             throw TranslationError.malformedResponse
         }
         return translations
+    }
+
+    public static func assistantText(_ json: [String: Any]?) -> String {
+        let choices = json?["choices"] as? [[String: Any]]
+        let message = choices?.first?["message"] as? [String: Any]
+        return message?["content"] as? String ?? ""
     }
 
     /// Extracts `{"translations": [...]}` from model output, tolerating code
