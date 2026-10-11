@@ -283,136 +283,90 @@ async function sendTranslation(lines, track, language, model, apiKey, http) {
   return translations
 }
 
-// Pulls each finished string out of a partial {"translations": [...]} reply so
-// lines can be shown while the rest of the response is still streaming.
+async function chatJSON(system, user, model, apiKey, http) {
+  const { status, body } = await http(DEEPSEEK_ENDPOINT, {
+    method: "POST",
+    headers: deepseekHeaders(apiKey),
+    body: JSON.stringify({
+      model,
+      max_tokens: 8192,
+      response_format: { type: "json_object" },
+      thinking: { type: "disabled" },
+      messages: [
+        { role: "system", content: system },
+        { role: "user", content: user },
+      ],
+    }),
+  })
+  const json = safeJSON(body)
+  if (status !== 200) throw new TranslationError(status, json?.error?.message || body || "Unknown error")
+  const text = assistantText(json)
+  const start = text.indexOf("{")
+  const end = text.lastIndexOf("}")
+  const object = start === -1 || end <= start ? null : safeJSON(text.slice(start, end + 1))
+  if (!object) throw declinedError()
+  return object
+}
+
+function wholeSongPrompt(track, language, count) {
+  return [
+    `Translate the complete lyrics of "${track.name}" by ${track.artist} into ${language} the way a skilled lyric translator would, reading them as one continuous text.`,
+    "Sentences often continue across line breaks: translate each sentence as a whole, then distribute its translation over the lines it spans so each line carries the part of the meaning sung on that line, in an order that still reads naturally line after line.",
+    `Lines already in ${language} or only vocalizations get an empty string.`,
+    `Respond with only a JSON object {"translations": [...]} with exactly ${count} strings, one per numbered line, in order.`,
+  ].join("\n")
+}
+
+// Sends the whole song in one request and lets the model match its
+// translation to the lines, which handles sentences that run across lines.
+// Returns one translation per input line, by position.
+async function translateWholeSong(lines, track, language, model, apiKey, http) {
+  if (!apiKey) throw new TranslationError("missing-key", "Add your DeepSeek API key to see translations.")
+  if (lines.length === 0) return []
+
+  const numbered = lines.map((line, index) => `${index + 1}|${line}`).join("\n")
+  let lastError = new TranslationError("malformed", "Translation failed: the model returned an unexpected response.")
+  for (let attempt = 0; attempt < 2; attempt += 1) {
+    try {
+      const { translations } = await chatJSON(wholeSongPrompt(track, language, lines.length), numbered, model, apiKey, http)
+      if (Array.isArray(translations) && translations.length === lines.length) {
+        return translations.map((translation) => String(translation ?? "").trim())
+      }
+    } catch (error) {
+      if (!(error instanceof TranslationError) || !error.isRetryable) throw error
+      lastError = error
+    }
+  }
+  throw lastError
+}
+
+// Applies translations by position when the lines on screen are the ones that
+// were translated, so a repeated line keeps the translation for its context.
+// Otherwise falls back to matching by line text. A "translation" identical to
+// its line (an English line, "la la la") is not shown.
+function applyPositionalTranslations(lines, result, owned) {
+  const nonEmpty = (lines ?? []).filter((line) => line && typeof line.text === "string" && line.text.trim())
+  const keys = nonEmpty.map((line) => lineKey(line.text))
+  const positional =
+    result.layout && result.layout.length === keys.length && result.layout.every((key, index) => key === keys[index])
+  if (!positional) return applyTranslationsToLines(lines, result.byKey ?? {}, owned)
+  let applied = 0
+  nonEmpty.forEach((line, index) => {
+    const translation = result.positional[index]
+    if (!translation || lineKey(translation) === keys[index]) return
+    const current = line.translation
+    if (current && current !== owned.get(line)) return
+    if (current !== translation) line.translation = translation
+    owned.set(line, translation)
+    applied += 1
+  })
+  return applied
+}
+
 // The model answered in prose instead of the requested JSON, e.g. it chose not
 // to translate the song. Retrying the same request would not change that.
 function declinedError() {
   return new TranslationError("declined", "The model didn't translate this song.")
-}
-
-function createTranslationStreamParser() {
-  let buffer = ""
-  let cursor = -1
-  let emitted = 0
-  return {
-    push(chunk) {
-      buffer += chunk
-      const found = []
-      if (cursor === -1) {
-        const key = buffer.indexOf('"translations"')
-        const open = key === -1 ? -1 : buffer.indexOf("[", key)
-        if (open === -1) return found
-        cursor = open + 1
-      }
-      while (cursor < buffer.length) {
-        const start = buffer.indexOf('"', cursor)
-        if (start === -1) {
-          cursor = buffer.length
-          break
-        }
-        const close = buffer.slice(cursor, start).indexOf("]")
-        if (close !== -1) {
-          cursor = buffer.length
-          break
-        }
-        let end = start + 1
-        while (end < buffer.length && buffer[end] !== '"') end += buffer[end] === "\\" ? 2 : 1
-        if (end >= buffer.length) break
-        try {
-          found.push({ index: emitted, text: String(JSON.parse(buffer.slice(start, end + 1))).trim() })
-        } catch {
-          found.push({ index: emitted, text: "" })
-        }
-        emitted += 1
-        cursor = end + 1
-      }
-      return found
-    },
-    get count() {
-      return emitted
-    },
-    get started() {
-      return cursor !== -1
-    },
-  }
-}
-
-// Splits DeepSeek/OpenAI server-sent events into text deltas.
-function createSSEParser() {
-  let buffer = ""
-  return function push(chunk) {
-    buffer += chunk.replace(/\r\n/g, "\n")
-    const events = buffer.split("\n\n")
-    buffer = events.pop()
-    const deltas = []
-    for (const event of events) {
-      const data = event
-        .split("\n")
-        .filter((line) => line.startsWith("data:"))
-        .map((line) => line.slice(5).trim())
-        .join("")
-      if (!data || data === "[DONE]") continue
-      const json = safeJSON(data)
-      if (json?.error) {
-        const status = json.error.code === "overloaded" || json.error.type === "overloaded_error" ? 529 : 500
-        throw new TranslationError(status, json.error.message || "Stream error")
-      }
-      const text = json?.choices?.[0]?.delta?.content
-      if (text) deltas.push(text)
-    }
-    return deltas
-  }
-}
-
-// Streams a translation and calls onTranslation(line, translation) as each
-// line arrives. Falls back to one non-streaming retry when the stream fails.
-async function streamTranslateLines(lines, track, language, model, apiKey, fetchImpl, onTranslation = () => {}) {
-  if (!apiKey) throw new TranslationError("missing-key", "Add your DeepSeek API key to see translations.")
-  const unique = uniqueLines(lines)
-  if (unique.length === 0) return {}
-
-  const result = {}
-  try {
-    const response = await fetchImpl(DEEPSEEK_ENDPOINT, {
-      method: "POST",
-      headers: deepseekHeaders(apiKey),
-      body: JSON.stringify(requestBody(unique, track, language, model, true)),
-    })
-    if (response.status !== 200) {
-      const body = await response.text()
-      throw new TranslationError(response.status, safeJSON(body)?.error?.message || body || "Unknown error")
-    }
-    const sse = createSSEParser()
-    const parser = createTranslationStreamParser()
-    const decoder = new TextDecoder()
-    const reader = response.body.getReader()
-    for (;;) {
-      const { done, value } = await reader.read()
-      const text = done ? decoder.decode() : decoder.decode(value, { stream: true })
-      for (const delta of sse(text)) {
-        for (const { index, text: translation } of parser.push(delta)) {
-          if (index >= unique.length) continue
-          result[unique[index]] = translation
-          if (translation) onTranslation(unique[index], translation)
-        }
-      }
-      if (done) break
-    }
-    if (parser.count === unique.length) return result
-    if (!parser.started) throw declinedError()
-  } catch (error) {
-    if (!(error instanceof TranslationError) || !error.isRetryable) throw error
-  }
-
-  const retried = await translateLines(unique, track, language, model, apiKey, async (url, options) => {
-    const response = await fetchImpl(url, options)
-    return { status: response.status, body: await response.text() }
-  })
-  for (const [line, translation] of Object.entries(retried)) {
-    if (translation && result[line] !== translation) onTranslation(line, translation)
-  }
-  return retried
 }
 
 // Writes translations onto Cider's lyric line objects. Lines that already
@@ -630,19 +584,6 @@ function detectLanguage(lines, fallback = "en") {
   let best = null
   for (const [code, count] of counts) if (!best || count > counts.get(best)) best = code
   return best && counts.get(best) / letters >= 0.15 ? best : (fallback || "en").split(/[-_]/)[0].toLowerCase()
-}
-
-const VOCALIZATION = /^(?:(?:oh+|ah+|la|na|yeah|ye|woo+|ooh+|hey|uh|mm+|da|ba|du|eh)[\s,!.~…-]*)+$/i
-const NON_LATIN_LETTER = /[^\p{Script=Latin}\p{P}\p{S}\p{N}\s]/u
-
-// Drops lines the model would only return blank for, before they are sent:
-// vocalizations, and Latin-script lines when translating into English.
-function linesToTranslate(lines, language) {
-  return uniqueLines(lines.map((line) => String(line ?? "").trim())).filter((line) => {
-    if (VOCALIZATION.test(line)) return false
-    if (language === "English" && !NON_LATIN_LETTER.test(line)) return false
-    return true
-  })
 }
 
 // ISO 639-1 codes Cider uses to look up official translations.
@@ -1111,8 +1052,8 @@ function startStoreMode(notifications) {
       decodeLines(entries)
       const key = `${song.id}|${settings.language}`
       if (!jobs.has(key)) jobs.set(key, translateSong(song, entries, settings, key))
-      const byKey = translations.get(key)
-      if (byKey) for (const entry of entries) applyTranslationsToLines(entry.lyrics, byKey, owned)
+      const result = translations.get(key)
+      if (result) for (const entry of entries) applyPositionalTranslations(entry.lyrics, result, owned)
     }
   }
 
@@ -1122,8 +1063,10 @@ function startStoreMode(notifications) {
     queueMicrotask(sync)
   }
 
-  const useTranslations = (key, byKey) => {
-    translations.set(key, byKey)
+  // A result is { byKey } for translations matched by line text, plus
+  // { layout, positional } for a whole-song translation applied by position.
+  const useTranslations = (key, result) => {
+    translations.set(key, result)
     scheduleSync()
   }
 
@@ -1146,18 +1089,18 @@ function startStoreMode(notifications) {
     const code = LANGUAGE_CODES[settings.language]
     const entry = entries[0]
     const lines = entry.lyrics.map((line) => decodeEntities(line.text ?? "").trim())
-    const show = (source, pairsOrByKey, isPairs = true) => {
-      const byKey = isPairs ? alignTranslations(lines, pairsOrByKey) : pairsOrByKey
+    const show = (source, pairs) => {
+      const byKey = alignTranslations(lines, pairs)
       for (const current of entriesFor(song.id)) clearOwnedTranslations(current.lyrics, owned)
       persistent.set(song.id, settings.language, { source, translations: byKey })
-      useTranslations(key, byKey)
+      useTranslations(key, { byKey })
     }
 
     // A replay shows the saved translation at once. Official translations
     // still replace a saved DeepSeek or machine translation.
     const saved = persistent.get(song.id, settings.language)
     const savedTranslations = saved?.translations ?? saved
-    if (savedTranslations) useTranslations(key, savedTranslations)
+    if (savedTranslations) useTranslations(key, { byKey: savedTranslations, layout: saved.layout, positional: saved.positional })
     if (saved?.source === "official") return
 
     const sourceLanguage = detectLanguage(lines.filter(Boolean), entry.info?.language)
@@ -1173,15 +1116,18 @@ function startStoreMode(notifications) {
       const machine = entry.ttml && code ? riseMachineTranslation(song.id, entry.ttml, sourceLanguage, code) : null
 
       try {
+        // The whole song is translated as one text and matched back to its
+        // lines, which keeps sentences that run across lines accurate.
+        const sung = lines.filter(Boolean)
+        const positional = await translateWholeSong(sung, song.track, settings.language, settings.model, settings.apiKey, browserHTTP)
+        const layout = sung.map((line) => lineKey(line))
         const byKey = {}
-        translations.set(key, byKey)
-        const result = await streamTranslateLines(linesToTranslate(lines, settings.language), song.track, settings.language, settings.model, settings.apiKey, fetch, (line, translation) => {
-          byKey[lineKey(line)] = translation
-          scheduleSync()
+        sung.forEach((line, index) => {
+          const translation = positional[index]
+          if (translation && !byKey[layout[index]] && lineKey(translation) !== layout[index]) byKey[layout[index]] = translation
         })
-        Object.assign(byKey, translationsByLineKey(result))
-        persistent.set(song.id, settings.language, { source: "deepseek", translations: byKey })
-        scheduleSync()
+        persistent.set(song.id, settings.language, { source: "deepseek", translations: byKey, layout, positional })
+        useTranslations(key, { byKey, layout, positional })
       } catch (error) {
         const fallback = machine ? await machine : null
         if (fallback) return show("cider", fallback)

@@ -32,7 +32,7 @@ Every song gets a translation request, whichever provider its lyrics came from:
 
 1. **Official translations.** Apple Music or NetEase translations, the same ones Cider's built-in translation uses.
 2. **Cider's machine translation.** If Cider's Rise server already translated the song, that translation is used.
-3. **DeepSeek.** Otherwise DeepSeek translates the lyrics and lines appear as the response streams in. Cider's machine translation is requested at the same time and is shown if DeepSeek declines or fails.
+3. **DeepSeek.** Otherwise the whole song goes to DeepSeek in one request. It reads the lyrics as one text, translates sentences that run across lines as a whole, and returns one translation per line, which is applied by position so repeated lines keep the translation for their context. Cider's machine translation is requested at the same time and is shown if DeepSeek declines or fails.
 
 Translations are saved locally, so replays and the next song in the queue are usually ready as soon as Cider shows the lyrics. Songs already in your target language are skipped.
 

@@ -449,8 +449,8 @@ function startStoreMode(notifications) {
       decodeLines(entries)
       const key = `${song.id}|${settings.language}`
       if (!jobs.has(key)) jobs.set(key, translateSong(song, entries, settings, key))
-      const byKey = translations.get(key)
-      if (byKey) for (const entry of entries) applyTranslationsToLines(entry.lyrics, byKey, owned)
+      const result = translations.get(key)
+      if (result) for (const entry of entries) applyPositionalTranslations(entry.lyrics, result, owned)
     }
   }
 
@@ -460,8 +460,10 @@ function startStoreMode(notifications) {
     queueMicrotask(sync)
   }
 
-  const useTranslations = (key, byKey) => {
-    translations.set(key, byKey)
+  // A result is { byKey } for translations matched by line text, plus
+  // { layout, positional } for a whole-song translation applied by position.
+  const useTranslations = (key, result) => {
+    translations.set(key, result)
     scheduleSync()
   }
 
@@ -484,18 +486,18 @@ function startStoreMode(notifications) {
     const code = LANGUAGE_CODES[settings.language]
     const entry = entries[0]
     const lines = entry.lyrics.map((line) => decodeEntities(line.text ?? "").trim())
-    const show = (source, pairsOrByKey, isPairs = true) => {
-      const byKey = isPairs ? alignTranslations(lines, pairsOrByKey) : pairsOrByKey
+    const show = (source, pairs) => {
+      const byKey = alignTranslations(lines, pairs)
       for (const current of entriesFor(song.id)) clearOwnedTranslations(current.lyrics, owned)
       persistent.set(song.id, settings.language, { source, translations: byKey })
-      useTranslations(key, byKey)
+      useTranslations(key, { byKey })
     }
 
     // A replay shows the saved translation at once. Official translations
     // still replace a saved DeepSeek or machine translation.
     const saved = persistent.get(song.id, settings.language)
     const savedTranslations = saved?.translations ?? saved
-    if (savedTranslations) useTranslations(key, savedTranslations)
+    if (savedTranslations) useTranslations(key, { byKey: savedTranslations, layout: saved.layout, positional: saved.positional })
     if (saved?.source === "official") return
 
     const sourceLanguage = detectLanguage(lines.filter(Boolean), entry.info?.language)
@@ -511,15 +513,18 @@ function startStoreMode(notifications) {
       const machine = entry.ttml && code ? riseMachineTranslation(song.id, entry.ttml, sourceLanguage, code) : null
 
       try {
+        // The whole song is translated as one text and matched back to its
+        // lines, which keeps sentences that run across lines accurate.
+        const sung = lines.filter(Boolean)
+        const positional = await translateWholeSong(sung, song.track, settings.language, settings.model, settings.apiKey, browserHTTP)
+        const layout = sung.map((line) => lineKey(line))
         const byKey = {}
-        translations.set(key, byKey)
-        const result = await streamTranslateLines(linesToTranslate(lines, settings.language), song.track, settings.language, settings.model, settings.apiKey, fetch, (line, translation) => {
-          byKey[lineKey(line)] = translation
-          scheduleSync()
+        sung.forEach((line, index) => {
+          const translation = positional[index]
+          if (translation && !byKey[layout[index]] && lineKey(translation) !== layout[index]) byKey[layout[index]] = translation
         })
-        Object.assign(byKey, translationsByLineKey(result))
-        persistent.set(song.id, settings.language, { source: "deepseek", translations: byKey })
-        scheduleSync()
+        persistent.set(song.id, settings.language, { source: "deepseek", translations: byKey, layout, positional })
+        useTranslations(key, { byKey, layout, positional })
       } catch (error) {
         const fallback = machine ? await machine : null
         if (fallback) return show("cider", fallback)

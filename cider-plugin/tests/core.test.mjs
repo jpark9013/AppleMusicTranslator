@@ -4,6 +4,7 @@ import {
   LyricsError,
   TranslationError,
   activeLineIndex,
+  applyPositionalTranslations,
   alignTranslations,
   applyTranslationsToLines,
   bestMatch,
@@ -11,23 +12,20 @@ import {
   clearOwnedTranslations,
   createMemoryCache,
   createPersistentCache,
-  createSSEParser,
-  createTranslationStreamParser,
   decodeEntities,
   detectLanguage,
   fetchLyrics,
   hasForeignTranslations,
   lineKey,
-  linesToTranslate,
   loadTranslatedLyrics,
   parseLRC,
   pairsFromTranslatedTtml,
   parseTranslations,
   requestBody,
   simplifiedTitle,
-  streamTranslateLines,
   thirdPartyLyricsRequest,
   ttmlLineTexts,
+  translateWholeSong,
   translationsByLineKey,
   translateLines,
   uniqueLines,
@@ -329,75 +327,6 @@ describe("displayed-lyrics fallback", () => {
   })
 })
 
-function sseResponse(text, chunkSize = 7) {
-  const events = []
-  for (let i = 0; i < text.length; i += chunkSize) {
-    events.push({ choices: [{ delta: { content: text.slice(i, i + chunkSize) } }] })
-  }
-  const body = events.map((event) => `data: ${JSON.stringify(event)}\n\n`).join("") + "data: [DONE]\n\n"
-  const bytes = new TextEncoder().encode(body)
-  return new Response(new ReadableStream({
-    start(controller) {
-      for (let i = 0; i < bytes.length; i += 11) controller.enqueue(bytes.slice(i, i + 11))
-      controller.close()
-    },
-  }), { status: 200 })
-}
-
-describe("streaming translation", () => {
-  it("emits each finished string from a partial reply", () => {
-    const parser = createTranslationStreamParser()
-    assert.deepEqual(parser.push('{"transl'), [])
-    assert.deepEqual(parser.push('ations": ["One \\"q\\"", "Tw'), [{ index: 0, text: 'One "q"' }])
-    assert.deepEqual(parser.push('o", ""]}'), [{ index: 1, text: "Two" }, { index: 2, text: "" }])
-    assert.equal(parser.count, 3)
-  })
-
-  it("ignores strings after the array closes", () => {
-    const parser = createTranslationStreamParser()
-    assert.deepEqual(parser.push('{"translations": ["a"], "note": "x"}').map((item) => item.text), ["a"])
-  })
-
-  it("reads text deltas from split server-sent events and surfaces stream errors", () => {
-    const push = createSSEParser()
-    assert.deepEqual(push('data: {"choices":[{"delta":{"content":"ab"}}]}\n'), [])
-    assert.deepEqual(push("\n"), ["ab"])
-    assert.throws(() => push('data: {"error":{"message":"busy","type":"overloaded_error"}}\n\n'), /busy/)
-  })
-
-  it("reports lines as they stream in", async () => {
-    const seen = []
-    const fetchImpl = async (url, options) => {
-      assert.equal(JSON.parse(options.body).stream, true)
-      return sseResponse('{"translations": ["Hello", "", "World"]}')
-    }
-    const result = await streamTranslateLines(["안녕", "오", "세상", "안녕"], track, "English", "m", "k", fetchImpl, (line, text) => seen.push([line, text]))
-    assert.deepEqual(seen, [["안녕", "Hello"], ["세상", "World"]])
-    assert.deepEqual(result, { 안녕: "Hello", 오: "", 세상: "World" })
-  })
-
-  it("retries without streaming when the line count is wrong", async () => {
-    const calls = []
-    const fetchImpl = async (url, options) => {
-      calls.push(JSON.parse(options.body).stream === true)
-      if (calls.length === 1) return sseResponse('{"translations": ["only one"]}')
-      return new Response(JSON.stringify({ choices: [{ message: { content: '{"translations": ["A", "B"]}' } }] }), { status: 200 })
-    }
-    const result = await streamTranslateLines(["a", "b"], track, "English", "m", "k", fetchImpl)
-    assert.deepEqual(calls, [true, false])
-    assert.deepEqual(result, { a: "A", b: "B" })
-  })
-
-  it("does not retry client errors", async () => {
-    let calls = 0
-    const fetchImpl = async () => {
-      calls += 1
-      return new Response('{"error":{"message":"bad key"}}', { status: 401 })
-    }
-    await assert.rejects(streamTranslateLines(["a"], track, "English", "m", "k", fetchImpl), /bad key/)
-    assert.equal(calls, 1)
-  })
-})
 
 describe("Cider lyric lines", () => {
   it("fills empty lines, keeps Cider's translations, and updates its own", () => {
@@ -436,27 +365,6 @@ describe("official translations", () => {
       [lineKey("같이 갈래")]: "Shall we go together?",
       [lineKey("어디든 좋아")]: "Anywhere is fine, let's walk slowly",
     })
-  })
-})
-
-describe("declined translations", () => {
-  it("does not retry when the stream answers in prose", async () => {
-    let calls = 0
-    const fetchImpl = async () => {
-      calls += 1
-      return sseResponse("I can't translate that, but here is a summary instead.")
-    }
-    await assert.rejects(
-      streamTranslateLines(["a", "b"], track, "English", "m", "k", fetchImpl),
-      (error) => error.code === "declined" && !error.isRetryable
-    )
-    assert.equal(calls, 1)
-  })
-
-  it("does not retry a prose reply without streaming either", async () => {
-    const http = fakeHTTP([{ status: 200, body: { choices: [{ message: { content: "No thanks." } }] } }])
-    await assert.rejects(translateLines(["a"], track, "English", "m", "k", http), (error) => error.code === "declined")
-    assert.equal(http.requests.length, 1)
   })
 })
 
@@ -505,15 +413,46 @@ describe("detectLanguage", () => {
   })
 })
 
-describe("linesToTranslate", () => {
-  const lines = ["오늘 날씨가 좋다", "Hold on tight", "oh oh oh", "La la la", "오늘 날씨가 좋다", "", "Yeah, yeah!", "Café ☕"]
+describe("whole-song translation", () => {
+  const lines = ["어제 두고 간", "우산을 아직 못 돌려줬어", "la la", "어제 두고 간"]
+  const chat = (content) => ({ status: 200, body: { choices: [{ message: { content } }] } })
 
-  it("skips vocalizations and English lines when translating into English", () => {
-    assert.deepEqual(linesToTranslate(lines, "English"), ["오늘 날씨가 좋다"])
+  it("sends every line in order, repeats included, and returns one translation per line", async () => {
+    const reply = ["What you left yesterday,", "the umbrella, I still haven't returned", "", "What you left yesterday"]
+    const http = fakeHTTP([chat(JSON.stringify({ translations: reply }))])
+    assert.deepEqual(await translateWholeSong(lines, track, "English", "m", "k", http), reply)
+    const body = JSON.parse(http.requests[0].options.body)
+    assert.equal(body.messages[1].content, "1|어제 두고 간\n2|우산을 아직 못 돌려줬어\n3|la la\n4|어제 두고 간")
+    assert.match(body.messages[0].content, /exactly 4 strings/)
+    assert.deepEqual(body.thinking, { type: "disabled" })
   })
 
-  it("keeps English lines for other target languages", () => {
-    assert.deepEqual(linesToTranslate(lines, "Spanish"), ["오늘 날씨가 좋다", "Hold on tight", "Café ☕"])
+  it("retries once when the line count is wrong", async () => {
+    const http = fakeHTTP([chat('{"translations": ["one"]}'), chat('{"translations": ["a", "b", "c", "d"]}')])
+    assert.deepEqual(await translateWholeSong(lines, track, "English", "m", "k", http), ["a", "b", "c", "d"])
+    assert.equal(http.requests.length, 2)
+  })
+
+  it("treats a prose reply as declined and does not retry it", async () => {
+    const http = fakeHTTP([chat("Sorry, I can't help with that.")])
+    await assert.rejects(translateWholeSong(lines, track, "English", "m", "k", http), (error) => error.code === "declined")
+    assert.equal(http.requests.length, 1)
+  })
+
+  it("applies by position on the same layout and by text otherwise", () => {
+    const owned = new WeakMap()
+    const result = {
+      layout: ["가", "나", "lala", "가"].map((text) => lineKey(text)),
+      positional: ["First A", "B", "la la", "Second A"],
+      byKey: { [lineKey("가")]: "First A" },
+    }
+    const same = [{ text: "가" }, { text: "" }, { text: "나" }, { text: "la la" }, { text: "가" }]
+    applyPositionalTranslations(same, result, owned)
+    assert.deepEqual(same.map((line) => line.translation), ["First A", undefined, "B", undefined, "Second A"])
+
+    const other = [{ text: "가" }, { text: "다" }]
+    applyPositionalTranslations(other, result, owned)
+    assert.deepEqual(other.map((line) => line.translation), ["First A", undefined])
   })
 })
 
